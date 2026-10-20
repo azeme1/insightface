@@ -1,7 +1,13 @@
 import argparse
 import logging
 import os
+import sys
 from datetime import datetime
+
+# ADD-ON: make the vendored llqll quantization package importable (it lives at
+# the insightface repo root, two levels up from recognition/arcface_torch).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+import llqll
 
 import numpy as np
 import torch
@@ -22,17 +28,20 @@ from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compr
 assert torch.__version__ >= "1.12.0", "In order to enjoy the features of the new torch, \
 we have upgraded the torch to 1.12.0. torch before than 1.12.0 may not work in the future."
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+backend = "nccl" if device == "cuda" else "gloo"
+
 try:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    distributed.init_process_group("nccl")
+    distributed.init_process_group(backend)
 except KeyError:
     rank = 0
     local_rank = 0
     world_size = 1
     distributed.init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method="tcp://127.0.0.1:12584",
         rank=rank,
         world_size=world_size,
@@ -46,7 +55,8 @@ def main(args):
     # global control random seed
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 
-    torch.cuda.set_device(local_rank)
+    if device == "cuda":
+        torch.cuda.set_device(local_rank)
 
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
@@ -93,10 +103,14 @@ def main(args):
     )
 
     backbone = get_model(
-        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
+        cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).to(device)
+
+    # ADD-ON: backbone to quantized version convert
+    backbone = llqll.convert_backbone(backbone, cfg)
 
     backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone, broadcast_buffers=False, device_ids=[local_rank], bucket_cap_mb=16,
+        module=backbone, broadcast_buffers=False,
+        device_ids=[local_rank] if device == "cuda" else None, bucket_cap_mb=16,
         find_unused_parameters=True)
     backbone.register_comm_hook(None, fp16_compress_hook)
 
@@ -116,7 +130,7 @@ def main(args):
         module_partial_fc = PartialFC_V2(
             margin_loss, cfg.embedding_size, cfg.num_classes,
             cfg.sample_rate, False)
-        module_partial_fc.train().cuda()
+        module_partial_fc.train().to(device)
         # TODO the params of partial fc must be last in the params list
         opt = torch.optim.SGD(
             params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
@@ -198,6 +212,9 @@ def main(args):
                     opt.zero_grad()
             lr_scheduler.step()
 
+            # ADD-ON: stage of the regularization update
+            llqll.step(backbone, opt, cfg)
+
             with torch.no_grad():
                 if wandb_logger:
                     wandb_logger.log({
@@ -214,6 +231,8 @@ def main(args):
                     callback_verification(global_step, backbone)
 
         if cfg.save_all_states:
+            # ADD-ON: quantized to original version convert + save the cluster values for the weights
+            llqll.save_quantized(backbone, cfg.output, f"gpu{rank}_epoch{epoch}", cfg)
             checkpoint = {
                 "epoch": epoch + 1,
                 "global_step": global_step,

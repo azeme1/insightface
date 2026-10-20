@@ -63,8 +63,8 @@ def get_dataloader(
     else:
         init_fn = partial(worker_init_fn, num_workers=num_workers, rank=rank, seed=seed)
 
-    train_loader = DataLoaderX(
-        local_rank=local_rank,
+    loader_cls = partial(DataLoaderX, local_rank=local_rank) if torch.cuda.is_available() else DataLoader
+    train_loader = loader_cls(
         dataset=train_set,
         batch_size=batch_size,
         sampler=train_sampler,
@@ -163,7 +163,7 @@ class MXFaceDataset(Dataset):
         label = header.label
         if not isinstance(label, numbers.Number):
             label = label[0]
-        label = torch.tensor(label, dtype=torch.long)
+        label = torch.tensor(int(label), dtype=torch.long)
         sample = mx.image.imdecode(img).asnumpy()
         if self.transform is not None:
             sample = self.transform(sample)

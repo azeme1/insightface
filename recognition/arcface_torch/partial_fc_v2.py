@@ -130,11 +130,11 @@ class PartialFC_V2(torch.nn.Module):
             f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}")
 
         _gather_embeddings = [
-            torch.zeros((batch_size, self.embedding_size)).cuda()
+            torch.zeros((batch_size, self.embedding_size), device=local_embeddings.device)
             for _ in range(self.world_size)
         ]
         _gather_labels = [
-            torch.zeros(batch_size).long().cuda() for _ in range(self.world_size)
+            torch.zeros(batch_size, dtype=torch.long, device=local_embeddings.device) for _ in range(self.world_size)
         ]
         _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
         distributed.all_gather(_gather_labels, local_labels)
